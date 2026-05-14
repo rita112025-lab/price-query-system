@@ -92,6 +92,9 @@ docker run -e DB_PASS=your_password -p 7860:7860 price-query
      - `DB_USER`：資料庫使用者，預設 `root`
      - `DB_PASS`：資料庫密碼（必要）
      - `DB_NAME`：資料庫名稱，預設 `price_query`
+     - `DB_USE_SSL`：是否啟用 SSL 連線，預設 `false`
+     - `DB_SSL_CA`：SSL CA 憑證檔案路徑，例如 `./tidb-ca.pem`
+     - `DB_SSL_CA_CONTENT`：若無法放檔案，可直接放入 CA 憑證文本內容
      - `HUGGINGFACE_TOKEN`：Hugging Face Token（可選）
 
 4. **SSL 憑證**
