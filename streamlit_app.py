@@ -17,6 +17,9 @@ st.markdown("""
 html, body, [class*="css"] { font-size: 20px !important; }
 .stDataFrame, .stDataEditor { font-size: 20px !important; }
 div[data-testid="stDataFrame"] * { font-size: 20px !important; }
+.block-container { padding-top: 1rem !important; }
+/* 取消 rerun 時的變暗效果 */
+[data-stale="true"] { opacity: 1 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -274,7 +277,7 @@ def import_dataframe(df: pd.DataFrame) -> tuple[int, list[str]]:
     return inserted, skipped
 
 
-def build_search_query(keyword: str, system_filter: str):
+def build_search_query(keyword: str, system_filter: str, sub_system_filter: str):
     conditions = []
     params = []
 
@@ -287,6 +290,10 @@ def build_search_query(keyword: str, system_filter: str):
         conditions.append("system = %s")
         params.append(system_filter)
 
+    if sub_system_filter and sub_system_filter != "全部":
+        conditions.append("sub_system = %s")
+        params.append(sub_system_filter)
+
     where_clause = " AND ".join(conditions) if conditions else "1"
     sql = f"""
     SELECT id, system, sub_system, vendor, name, spec, unit, unit_price, quote_date
@@ -298,9 +305,9 @@ def build_search_query(keyword: str, system_filter: str):
     return sql, params
 
 
-def query_materials(keyword: str, system_filter: str) -> pd.DataFrame:
+def query_materials(keyword: str, system_filter: str, sub_system_filter: str) -> pd.DataFrame:
     ensure_database_and_table()
-    sql, params = build_search_query(keyword.strip(), system_filter)
+    sql, params = build_search_query(keyword.strip(), system_filter, sub_system_filter)
     with get_connection(DB_NAME) as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, params)
@@ -328,6 +335,14 @@ def truncate_materials():
             cursor.execute("TRUNCATE TABLE materials")
 
 
+def reset_search_filters():
+    for key in ("filter_keyword", "filter_sys_major", "filter_sys_sub"):
+        st.session_state.pop(key, None)
+    st.session_state.pop("search_results", None)
+    st.session_state.pop("search_keyword", None)
+
+
+@st.cache_data(ttl=300)
 def load_system_options() -> list[str]:
     ensure_database_and_table()
     with get_connection(DB_NAME) as conn:
@@ -335,6 +350,22 @@ def load_system_options() -> list[str]:
             cursor.execute("SELECT DISTINCT system FROM materials WHERE system IS NOT NULL AND system != '' ORDER BY system")
             rows = cursor.fetchall()
     return ["全部"] + [r["system"] for r in rows]
+
+
+@st.cache_data(ttl=300)
+def load_sub_system_options(system: str) -> list[str]:
+    ensure_database_and_table()
+    with get_connection(DB_NAME) as conn:
+        with conn.cursor() as cursor:
+            if system and system != "全部":
+                cursor.execute(
+                    "SELECT DISTINCT sub_system FROM materials WHERE sub_system IS NOT NULL AND sub_system != '' AND system = %s ORDER BY sub_system",
+                    (system,),
+                )
+            else:
+                cursor.execute("SELECT DISTINCT sub_system FROM materials WHERE sub_system IS NOT NULL AND sub_system != '' ORDER BY sub_system")
+            rows = cursor.fetchall()
+    return ["全部"] + [r["sub_system"] for r in rows]
 
 
 def load_all_materials() -> pd.DataFrame:
@@ -375,22 +406,40 @@ RESULT_COLUMNS = {
 if search_type == "查詢":
     st.subheader("🔍 搜尋材料")
 
-    col1, col2, col3 = st.columns([3, 2, 1])
+    for _k, _v in [("filter_keyword", ""), ("filter_sys_major", "全部"), ("filter_sys_sub", "全部")]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    if st.session_state.pop("reset_search_filters_requested", False):
+        reset_search_filters()
+
+    col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 1, 1])
     with col1:
-        keyword = st.text_input("輸入關鍵字（品名/規格/廠商/系統子類）")
+        keyword = st.text_input("輸入關鍵字（品名/規格/廠商/系統子類）", key="filter_keyword")
     with col2:
         try:
             system_options = load_system_options()
         except Exception:
             system_options = ["全部"]
-        sys_major = st.selectbox("系統大類", system_options)
+        sys_major = st.selectbox("系統大類", system_options, key="filter_sys_major")
     with col3:
+        try:
+            sub_system_options = load_sub_system_options(sys_major)
+        except Exception:
+            sub_system_options = ["全部"]
+        sys_sub = st.selectbox("系統子類", sub_system_options, key="filter_sys_sub")
+    with col4:
         st.markdown("<br>", unsafe_allow_html=True)
         search_clicked = st.button("搜尋", use_container_width=True)
+    with col5:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("清除篩選", use_container_width=True):
+            st.session_state["reset_search_filters_requested"] = True
+            st.rerun()
 
     if search_clicked:
         try:
-            st.session_state["search_results"] = query_materials(keyword, sys_major)
+            st.session_state["search_results"] = query_materials(keyword, sys_major, sys_sub)
         except Exception as exc:
             st.error(f"查詢失敗：{exc}")
             st.session_state.pop("search_results", None)
