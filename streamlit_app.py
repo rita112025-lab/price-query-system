@@ -186,7 +186,7 @@ def ensure_database_and_table():
 
 
 
-def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     normalized = {}
     for col in df.columns:
         key = str(col).strip()
@@ -226,21 +226,48 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "unit",
         "unit_price",
         "quote_date",
-    ]]
-    df = df.dropna(subset=["name", "unit_price"])
-    df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce")
+    ]].copy()
+
+    df["_source_row"] = df.index + 2
+    df["name"] = df["name"].astype("string").str.strip()
+    blank_name = df["name"].isna() | (df["name"] == "")
+
+    price_text = (
+        df["unit_price"]
+        .astype("string")
+        .str.strip()
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace("NTD", "", regex=False)
+        .str.replace("NT", "", regex=False)
+        .str.replace("元", "", regex=False)
+    )
+    df["unit_price"] = pd.to_numeric(price_text, errors="coerce")
     df["unit_price"] = df["unit_price"].replace([float("inf"), float("-inf")], pd.NA)
-    df = df.dropna(subset=["unit_price"])
+    invalid_price = df["unit_price"].isna()
+
+    skipped: list[str] = []
+    for _, row in df[blank_name | invalid_price].iterrows():
+        reasons = []
+        if blank_name.loc[row.name]:
+            reasons.append("品名空白")
+        if invalid_price.loc[row.name]:
+            reasons.append("單價空白或不是數字")
+        skipped.append(f"Excel/CSV 第 {int(row['_source_row'])} 列跳過：{'、'.join(reasons)}")
+
+    df = df[~(blank_name | invalid_price)].copy()
     df["unit_price"] = df["unit_price"].clip(lower=0, upper=9_999_999_999_999.99)
     df["quote_date"] = pd.to_datetime(df["quote_date"], errors="coerce").dt.date
     df["quote_date"] = df["quote_date"].fillna(datetime.today().date())
+    df = df.drop(columns=["_source_row"])
 
-    return df
+    return df, skipped
 
 
-def import_dataframe(df: pd.DataFrame) -> tuple[int, list[str]]:
+def import_dataframe(df: pd.DataFrame) -> tuple[int, list[str], int]:
     ensure_database_and_table()
-    df = normalize_dataframe(df)
+    source_count = len(df)
+    df, skipped = normalize_dataframe(df)
     df["unit_price"] = df["unit_price"].astype(float)
 
     insert_sql = """
@@ -260,12 +287,11 @@ def import_dataframe(df: pd.DataFrame) -> tuple[int, list[str]]:
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     rows = [tuple(
-        None if (isinstance(v, float) and pd.isna(v)) else v
+        None if pd.isna(v) else v
         for v in row
     ) for row in df.itertuples(index=False, name=None)]
 
     inserted = 0
-    skipped: list[str] = []
     with get_connection(DB_NAME) as conn:
         with conn.cursor() as cursor:
             for i, row in enumerate(rows):
@@ -274,7 +300,7 @@ def import_dataframe(df: pd.DataFrame) -> tuple[int, list[str]]:
                     inserted += 1
                 except Exception as e:
                     skipped.append(f"第 {i+1} 筆（{row[6]}，單價={row[9]}）：{e}")
-    return inserted, skipped
+    return inserted, skipped, source_count
 
 
 def build_search_query(keyword: str, system_filter: str, sub_system_filter: str):
@@ -392,7 +418,6 @@ except Exception as exc:
     st.sidebar.error(str(exc))
 
 RESULT_COLUMNS = {
-    "id": st.column_config.NumberColumn("ID", width="small", format="%d"),
     "system": st.column_config.TextColumn("系統大類"),
     "sub_system": st.column_config.TextColumn("系統子類"),
     "vendor": st.column_config.TextColumn("廠商簡稱"),
@@ -451,8 +476,9 @@ if search_type == "查詢":
             st.warning("找不到符合條件的資料。")
         else:
             st.success(f"查詢完成，共 {len(results)} 筆資料。")
-            st.dataframe(results, use_container_width=True, hide_index=True, column_config=RESULT_COLUMNS)
-            csv = results.to_csv(index=False, encoding="utf-8-sig")
+            display_results = results.drop(columns=["id"], errors="ignore")
+            st.dataframe(display_results, use_container_width=True, hide_index=True, column_config=RESULT_COLUMNS)
+            csv = display_results.to_csv(index=False, encoding="utf-8-sig")
             st.download_button("下載 CSV", csv, file_name="search_results.csv", mime="text/csv")
 
 elif search_type == "匯入":
@@ -467,12 +493,14 @@ elif search_type == "匯入":
                     df = pd.read_csv(uploaded_file)
                 else:
                     df = pd.read_excel(uploaded_file)
-                inserted, skipped = import_dataframe(df)
-                st.success(f"匯入完成，共 {inserted} 筆成功。")
+                inserted, skipped, source_count = import_dataframe(df)
+                st.success(f"匯入完成：檔案讀取 {source_count} 筆，成功 {inserted} 筆。")
                 if skipped:
                     st.warning(f"跳過 {len(skipped)} 筆有問題的資料：")
                     for msg in skipped[:20]:
                         st.text(msg)
+                    if len(skipped) > 20:
+                        st.caption(f"另有 {len(skipped) - 20} 筆未顯示。")
             except Exception as exc:
                 st.error(f"匯入失敗：{exc}")
 
@@ -486,6 +514,7 @@ elif search_type == "刪除":
             st.info("目前沒有可刪除的資料。")
         else:
             select_all = st.checkbox("全選", key="delete_select_all")
+            all_data = all_data.set_index("id", drop=True)
             all_data.insert(0, "勾選", select_all)
             edited = st.data_editor(
                 all_data,
@@ -493,7 +522,7 @@ elif search_type == "刪除":
                     "勾選": st.column_config.CheckboxColumn("勾選", help="勾選要刪除的項目", width="small"),
                     **RESULT_COLUMNS,
                 },
-                disabled=["id", "system", "sub_system", "vendor", "name", "spec", "unit", "unit_price", "quote_date"],
+                disabled=["system", "sub_system", "vendor", "name", "spec", "unit", "unit_price", "quote_date"],
                 hide_index=True,
                 use_container_width=True,
             )
@@ -507,7 +536,7 @@ elif search_type == "刪除":
                     st.info(f"已選擇 {selected_count} 筆，按右側按鈕確認刪除。")
             with col_btn:
                 if st.button("確認刪除", disabled=(selected_count == 0), type="primary", use_container_width=True):
-                    deleted = delete_materials(selected_rows["id"].tolist())
+                    deleted = delete_materials(selected_rows.index.tolist())
                     st.success(f"已刪除 {deleted} 筆資料。")
                     st.session_state.pop("search_results", None)
                     st.rerun()
